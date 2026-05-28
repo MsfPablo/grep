@@ -1,0 +1,50 @@
+name: Benchmarks
+
+# spell-checker:ignore codspeed dtolnay Swatinem sccache
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+# End the current execution if there is a new changeset in the PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  benchmarks:
+    name: Run benchmarks (CodSpeed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Build benchmarks
+        run: cargo codspeed build -p uu_grep
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v4
+        env:
+          CODSPEED_LOG: debug
+        with:
+          mode: simulation
+          run: cargo codspeed run -p uu_grep > /dev/null
+          token: ${{ secrets.CODSPEED_TOKEN }}
