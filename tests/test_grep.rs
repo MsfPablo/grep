@@ -127,6 +127,28 @@ fn ere_invalid_pattern_is_error() {
 }
 
 #[test]
+fn quiet_match_overrides_file_error() {
+    // With -q, a match makes grep exit 0 even if an earlier file could not be
+    // opened. Without -q the missing file still yields exit 2, and -q with no
+    // match keeps the error status.
+    let (_s, mut c) = ucmd();
+    c.args(&["-q", "abc", "no-such-file", "-"])
+        .pipe_in("abcd\n")
+        .succeeds()
+        .no_output();
+
+    let (_s, mut c) = ucmd();
+    c.args(&["abc", "no-such-file", "-"])
+        .pipe_in("abcd\n")
+        .fails_with_code(2);
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-q", "zzz", "no-such-file", "-"])
+        .pipe_in("abcd\n")
+        .fails_with_code(2);
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();

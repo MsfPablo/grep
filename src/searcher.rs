@@ -117,7 +117,12 @@ impl<'a> Searcher<'a> {
             .flush()
             .map_err_context(|| "(standard output)".to_string())?;
 
-        if self.had_error {
+        // With -q, a match yields exit status 0 even if an error (e.g. a
+        // missing file) occurred earlier: GNU exits as soon as a line is
+        // selected, so the error never affects the status.
+        if self.config.quiet && self.any_match {
+            Ok(())
+        } else if self.had_error {
             Err(ExitCode::new(2))
         } else if self.any_match {
             Ok(())
