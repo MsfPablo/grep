@@ -181,6 +181,19 @@ fn lookalike_brackets_are_not_confusing() {
 }
 
 #[test]
+fn reversed_range_uses_gnu_wording() {
+    // A range like `[b-a]` is an error; GNU prints the bare POSIX diagnostic
+    // "Invalid range end" (not oniguruma's phrasing) and exits 2.
+    for args in [&["[b-a]"][..], &["-E", "[b-a]"][..]] {
+        let (_s, mut c) = ucmd();
+        c.args(args)
+            .pipe_in("x\n")
+            .fails_with_code(2)
+            .stderr_is("grep: Invalid range end\n");
+    }
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();

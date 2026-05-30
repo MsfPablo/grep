@@ -8,7 +8,9 @@ use onig::{
     EncodedBytes, Regex, RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior,
     SyntaxOperator,
 };
-use onig_sys::{OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8};
+use onig_sys::{
+    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
+};
 use uucore::error::{UResult, USimpleError};
 
 pub struct Matcher<'a> {
@@ -240,7 +242,12 @@ impl CompiledPattern {
 
         fn compile_with(pattern: &str, syntax: &Syntax, options: RegexOptions) -> UResult<Regex> {
             Regex::with_options_and_encoding(pattern, options, syntax).map_err(|err| {
-                USimpleError::new(2, format!("invalid pattern \"{pattern}\": {err}"))
+                // Prefer GNU grep's wording for the errors it has a dedicated
+                // message for; fall back to oniguruma's text otherwise.
+                match gnu_error_message(err.code()) {
+                    Some(msg) => USimpleError::new(2, msg.to_string()),
+                    None => USimpleError::new(2, format!("invalid pattern \"{pattern}\": {err}")),
+                }
             })
         }
 
@@ -293,6 +300,19 @@ impl CompiledPattern {
                 None,
             )
             .is_some()
+    }
+}
+
+/// Map an oniguruma compile-error code to GNU grep's wording for the same
+/// condition, when one exists. GNU emits a bare POSIX-style diagnostic (e.g.
+/// `Invalid range end`) rather than oniguruma's phrasing, so translating keeps
+/// us byte-compatible. Returns `None` for errors with no GNU equivalent, where
+/// the caller falls back to oniguruma's own message.
+fn gnu_error_message(code: i32) -> Option<&'static str> {
+    match code {
+        // e.g. `[b-a]`: a range whose end precedes its start.
+        ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS => Some("Invalid range end"),
+        _ => None,
     }
 }
 
