@@ -194,6 +194,18 @@ fn reversed_range_uses_gnu_wording() {
 }
 
 #[test]
+fn pcre_backtracking_limit_does_not_abort() {
+    // A pathological PCRE pattern can exceed oniguruma's retry limit. GNU
+    // grep reports this and exits 2 (it must not crash); stdout stays empty.
+    let (_s, mut c) = ucmd();
+    c.args(&["-P", "((a+)*)+$"])
+        .pipe_in("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\n")
+        .fails_with_code(2)
+        .stdout_is("")
+        .stderr_contains("backtracking limit");
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();

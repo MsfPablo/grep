@@ -5,12 +5,14 @@
 
 use crate::{Config, RegexMode};
 use onig::{
-    EncodedBytes, Regex, RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior,
-    SyntaxOperator,
+    EncodedBytes, Error, MatchParam, Regex, RegexOptions, Region, SearchOptions, Syntax,
+    SyntaxBehavior, SyntaxOperator,
 };
 use onig_sys::{
-    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
+    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, ONIGERR_RETRY_LIMIT_IN_MATCH_OVER,
+    ONIGERR_RETRY_LIMIT_IN_SEARCH_OVER, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
+use std::io;
 use uucore::error::{UResult, USimpleError};
 
 pub struct Matcher<'a> {
@@ -28,26 +30,30 @@ impl<'a> Matcher<'a> {
     }
 
     /// Decide whether `line` matches and return the positions to highlight.
-    pub fn match_line(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
+    ///
+    /// Returns an error if the regex engine bails out (e.g. it exceeds its
+    /// backtracking retry limit on a pathological pattern); the caller turns
+    /// that into a GNU-style diagnostic and exit code 2 rather than aborting.
+    pub fn match_line(&self, line: &[u8]) -> io::Result<Option<Vec<(usize, usize)>>> {
         let mut any_seen = false;
-        let positions: Vec<_> = MatchIter::new(&self.patterns, line)
-            .filter(|&(start, end)| {
-                any_seen = true;
-                // Drop zero-length matches from the output.
-                if start == end {
-                    return false;
-                }
-                // Drop matches that don't span the whole line if `-x` was requested.
-                if self.config.line_regexp && !(start == 0 && end == line.len()) {
-                    return false;
-                }
-                // Drop matches that aren't word matches if `-w` was requested.
-                if self.config.word_regexp && !Self::is_word_match(line, start, end) {
-                    return false;
-                }
-                true
-            })
-            .collect();
+        let mut positions = Vec::new();
+        let mut iter = MatchIter::new(&self.patterns, line).map_err(match_error)?;
+        while let Some((start, end)) = iter.next_match().map_err(match_error)? {
+            any_seen = true;
+            // Drop zero-length matches from the output.
+            if start == end {
+                continue;
+            }
+            // Drop matches that don't span the whole line if `-x` was requested.
+            if self.config.line_regexp && !(start == 0 && end == line.len()) {
+                continue;
+            }
+            // Drop matches that aren't word matches if `-w` was requested.
+            if self.config.word_regexp && !Self::is_word_match(line, start, end) {
+                continue;
+            }
+            positions.push((start, end));
+        }
 
         let raw_matched = if self.config.line_regexp || self.config.word_regexp {
             // -w / -x are authoritative once positions are filtered.
@@ -56,23 +62,25 @@ impl<'a> Matcher<'a> {
             any_seen
         };
 
-        if raw_matched != self.config.invert_match {
-            Some(positions)
-        } else {
-            None
-        }
+        Ok((raw_matched != self.config.invert_match).then_some(positions))
     }
 
     /// Cheap match check that doesn't enumerate positions.
-    pub fn is_match(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn is_match(&self, line: &[u8]) -> io::Result<Option<Vec<(usize, usize)>>> {
         // `-w` / `-x` need positions to filter, so we fall back to `match_line`.
         let matched = if self.config.line_regexp || self.config.word_regexp {
-            self.match_line(line).is_some()
+            self.match_line(line)?.is_some()
         } else {
-            let raw_matched = self.patterns.iter().any(|p| p.is_match(line));
+            let mut raw_matched = false;
+            for p in &self.patterns {
+                if p.is_match(line).map_err(match_error)? {
+                    raw_matched = true;
+                    break;
+                }
+            }
             raw_matched != self.config.invert_match
         };
-        matched.then(Vec::new)
+        Ok(matched.then(Vec::new))
     }
 
     /// Word-boundary check `-w`.
@@ -114,35 +122,31 @@ struct MatchIter<'a> {
 }
 
 impl<'a> MatchIter<'a> {
-    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> Self {
-        Self {
-            cursors: patterns
-                .iter()
-                .map(|pattern| {
-                    let mut c = Cursor {
-                        pattern,
-                        line,
-                        offset: 0,
-                        pending: None,
-                    };
-                    c.refill();
-                    c
-                })
-                .collect(),
-            last_end: 0,
+    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> Result<Self, Error> {
+        let mut cursors = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let mut c = Cursor {
+                pattern,
+                line,
+                offset: 0,
+                pending: None,
+            };
+            c.refill()?;
+            cursors.push(c);
         }
+        Ok(Self {
+            cursors,
+            last_end: 0,
+        })
     }
-}
 
-impl<'a> Iterator for MatchIter<'a> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Yield the next match across all patterns, or `None` when exhausted.
+    fn next_match(&mut self) -> Result<Option<(usize, usize)>, Error> {
         // Discard stale pendings that fall before the last emit.
         for cursor in &mut self.cursors {
             if matches!(cursor.pending, Some((s, _)) if s < self.last_end) {
                 cursor.offset = self.last_end;
-                cursor.refill();
+                cursor.refill()?;
             }
         }
 
@@ -155,12 +159,15 @@ impl<'a> Iterator for MatchIter<'a> {
             .enumerate()
             .filter_map(|(i, c)| c.pending.map(|p| (i, p)))
             .min_by_key(|&(_, (s, e))| (s, std::cmp::Reverse(e)))
-            .map(|(i, _)| i)?;
+            .map(|(i, _)| i);
+        let Some(best_idx) = best_idx else {
+            return Ok(None);
+        };
 
         let (start, end) = self.cursors[best_idx].pending.unwrap();
-        self.cursors[best_idx].refill();
+        self.cursors[best_idx].refill()?;
         self.last_end = end;
-        Some((start, end))
+        Ok(Some((start, end)))
     }
 }
 
@@ -175,24 +182,25 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn refill(&mut self) {
+    fn refill(&mut self) -> Result<(), Error> {
         if self.offset >= self.line.len() {
             self.pending = None;
-            return;
+            return Ok(());
         }
-        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)
+        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)?
         else {
             self.pending = None;
-            return;
+            return Ok(());
         };
         let end = self
             .pattern
-            .longest_end_at(self.line, start)
+            .longest_end_at(self.line, start)?
             .unwrap_or(leftmost_end);
         // Advance the next search past the match we just found.
         // Zero-length matches need a +1 nudge to avoid spinning forever.
         self.offset = end.max(start + 1);
         self.pending = Some((start, end));
+        Ok(())
     }
 }
 
@@ -264,43 +272,63 @@ impl CompiledPattern {
     }
 
     /// Find the leftmost match starting at or after `offset`.
-    fn search_leftmost(&self, line: &[u8], offset: usize) -> Option<(usize, usize)> {
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> Result<Option<(usize, usize)>, Error> {
         let mut region = Region::new();
-        self.leftmost.search_with_encoding(
+        let found = self.leftmost.search_with_param(
             EncodedBytes::from_parts(line, &raw mut OnigEncodingUTF8),
             offset,
             line.len(),
             SearchOptions::SEARCH_OPTION_NONE,
             Some(&mut region),
+            MatchParam::default(),
         )?;
-        region.pos(0)
+        Ok(found.and_then(|_| region.pos(0)))
     }
 
     /// Given a known leftmost start `start`, return the longest extent
     /// of a match anchored exactly there = POSIX leftmost-longest end.
-    fn longest_end_at(&self, line: &[u8], start: usize) -> Option<usize> {
+    fn longest_end_at(&self, line: &[u8], start: usize) -> Result<Option<usize>, Error> {
         let mut region = Region::new();
-        self.longest_anchored.match_with_encoding(
+        self.longest_anchored.match_with_param(
             EncodedBytes::from_parts(line, &raw mut OnigEncodingUTF8),
             start,
             SearchOptions::SEARCH_OPTION_NONE,
             Some(&mut region),
-        );
-        region.pos(0).map(|(_, end)| end)
+            MatchParam::default(),
+        )?;
+        Ok(region.pos(0).map(|(_, end)| end))
     }
 
     /// True if any match exists in `line` (including zero-length).
-    fn is_match(&self, line: &[u8]) -> bool {
-        self.leftmost
-            .search_with_encoding(
+    fn is_match(&self, line: &[u8]) -> Result<bool, Error> {
+        Ok(self
+            .leftmost
+            .search_with_param(
                 EncodedBytes::from_parts(line, &raw mut OnigEncodingUTF8),
                 0,
                 line.len(),
                 SearchOptions::SEARCH_OPTION_NONE,
                 None,
-            )
-            .is_some()
+                MatchParam::default(),
+            )?
+            .is_some())
     }
+}
+
+/// Convert a regex-engine match-time error into an I/O error carrying GNU
+/// grep's wording. The only error we expect in practice is the backtracking
+/// retry limit being exceeded on a pathological pattern; GNU reports this as
+/// `exceeded PCRE's backtracking limit` and exits 2 instead of aborting.
+fn match_error(err: Error) -> io::Error {
+    let message = if matches!(
+        err.code(),
+        ONIGERR_RETRY_LIMIT_IN_MATCH_OVER | ONIGERR_RETRY_LIMIT_IN_SEARCH_OVER
+    ) {
+        "exceeded PCRE's backtracking limit".to_string()
+    } else {
+        err.description().to_string()
+    };
+    io::Error::other(message)
 }
 
 /// Map an oniguruma compile-error code to GNU grep's wording for the same
