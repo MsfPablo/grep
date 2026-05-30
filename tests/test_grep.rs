@@ -130,10 +130,11 @@ fn ere_invalid_pattern_is_error() {
 fn confusing_bracket_class_is_error() {
     // GNU grep rejects the misspelled `[:name:]` form (meant to be
     // `[[:name:]]`) with a dedicated diagnostic and exit code 2.
+    // No piped input: the pattern is rejected at compile time, before stdin is
+    // read, so feeding stdin would race with the child exiting (broken pipe).
     for pattern in ["[:space:]", "[:digit:]", "[^:space:]", "x[:space:]y"] {
         let (_s, mut c) = ucmd();
         c.args(&[pattern])
-            .pipe_in("x\n")
             .fails_with_code(2)
             .stderr_is("grep: character class syntax is [[:space:]], not [:space:]\n");
     }
@@ -141,7 +142,6 @@ fn confusing_bracket_class_is_error() {
     // The same diagnostic applies in extended mode.
     let (_s, mut c) = ucmd();
     c.args(&["-E", "[:space:]"])
-        .pipe_in("x\n")
         .fails_with_code(2)
         .stderr_is("grep: character class syntax is [[:space:]], not [:space:]\n");
 }
@@ -184,10 +184,10 @@ fn lookalike_brackets_are_not_confusing() {
 fn reversed_range_uses_gnu_wording() {
     // A range like `[b-a]` is an error; GNU prints the bare POSIX diagnostic
     // "Invalid range end" (not oniguruma's phrasing) and exits 2.
+    // No piped input: the pattern is rejected before stdin is read.
     for args in [&["[b-a]"][..], &["-E", "[b-a]"][..]] {
         let (_s, mut c) = ucmd();
         c.args(args)
-            .pipe_in("x\n")
             .fails_with_code(2)
             .stderr_is("grep: Invalid range end\n");
     }
@@ -203,6 +203,33 @@ fn pcre_backtracking_limit_does_not_abort() {
         .fails_with_code(2)
         .stdout_is("")
         .stderr_contains("backtracking limit");
+}
+
+#[test]
+fn invalid_backreference_uses_gnu_wording() {
+    // A back-reference to a non-existent group is worded differently by GNU
+    // depending on the engine: PCRE (-P) vs gnulib regex (BRE/ERE).
+    // No piped input: these patterns are rejected before stdin is read.
+    let (_s, mut c) = ucmd();
+    c.args(&["-P", r"(.)\2"])
+        .fails_with_code(2)
+        .stderr_is("grep: reference to non-existent subpattern\n");
+
+    for args in [&["-E", r"(.)\2"][..], &[r"\(.\)\2"][..]] {
+        let (_s, mut c) = ucmd();
+        c.args(args)
+            .fails_with_code(2)
+            .stderr_is("grep: Invalid back reference\n");
+    }
+
+    // A valid back-reference with -Pw / -Px must still match.
+    for flag in ["-Pw", "-Px"] {
+        let (_s, mut c) = ucmd();
+        c.args(&[flag, r"(.)\1"])
+            .pipe_in("aa\n")
+            .succeeds()
+            .stdout_is("aa\n");
+    }
 }
 
 #[test]

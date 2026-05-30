@@ -9,7 +9,7 @@ use onig::{
     SyntaxBehavior, SyntaxOperator,
 };
 use onig_sys::{
-    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, ONIGERR_RETRY_LIMIT_IN_MATCH_OVER,
+    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, ONIGERR_INVALID_BACKREF, ONIGERR_RETRY_LIMIT_IN_MATCH_OVER,
     ONIGERR_RETRY_LIMIT_IN_SEARCH_OVER, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
 use std::io;
@@ -248,22 +248,29 @@ impl CompiledPattern {
             options |= RegexOptions::REGEX_OPTION_IGNORECASE;
         }
 
-        fn compile_with(pattern: &str, syntax: &Syntax, options: RegexOptions) -> UResult<Regex> {
+        let mode = config.regex_mode;
+        fn compile_with(
+            pattern: &str,
+            syntax: &Syntax,
+            options: RegexOptions,
+            mode: RegexMode,
+        ) -> UResult<Regex> {
             Regex::with_options_and_encoding(pattern, options, syntax).map_err(|err| {
                 // Prefer GNU grep's wording for the errors it has a dedicated
                 // message for; fall back to oniguruma's text otherwise.
-                match gnu_error_message(err.code()) {
+                match gnu_error_message(err.code(), mode) {
                     Some(msg) => USimpleError::new(2, msg.to_string()),
                     None => USimpleError::new(2, format!("invalid pattern \"{pattern}\": {err}")),
                 }
             })
         }
 
-        let leftmost = compile_with(pattern, &syntax, options)?;
+        let leftmost = compile_with(pattern, &syntax, options, mode)?;
         let longest_anchored = compile_with(
             pattern,
             &syntax,
             options | RegexOptions::REGEX_OPTION_FIND_LONGEST,
+            mode,
         )?;
         Ok(Self {
             leftmost,
@@ -336,10 +343,16 @@ fn match_error(err: Error) -> io::Error {
 /// `Invalid range end`) rather than oniguruma's phrasing, so translating keeps
 /// us byte-compatible. Returns `None` for errors with no GNU equivalent, where
 /// the caller falls back to oniguruma's own message.
-fn gnu_error_message(code: i32) -> Option<&'static str> {
+fn gnu_error_message(code: i32, mode: RegexMode) -> Option<&'static str> {
     match code {
         // e.g. `[b-a]`: a range whose end precedes its start.
         ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS => Some("Invalid range end"),
+        // e.g. `(.)\2`: a back-reference to a group that does not exist. GNU
+        // (via PCRE2) and gnulib's regex word this differently.
+        ONIGERR_INVALID_BACKREF if mode == RegexMode::Perl => {
+            Some("reference to non-existent subpattern")
+        }
+        ONIGERR_INVALID_BACKREF => Some("Invalid back reference"),
         _ => None,
     }
 }
