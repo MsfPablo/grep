@@ -233,6 +233,36 @@ fn invalid_backreference_uses_gnu_wording() {
 }
 
 #[test]
+fn grep_colors_mt_and_grep_color_deprecation() {
+    // GREP_COLORS `mt` sets the match color (both selected and context).
+    let (_s, mut c) = ucmd();
+    c.args(&["--color=always", "."])
+        .env("GREP_COLORS", "mt=36")
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("\u{1b}[36m\u{1b}[Kx\u{1b}[m\u{1b}[K\n");
+
+    // GREP_COLOR is deprecated: it still sets the match color, but emits a
+    // warning when color is actually produced.
+    let (_s, mut c) = ucmd();
+    c.args(&["--color=always", "."])
+        .env("GREP_COLOR", "36")
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("\u{1b}[36m\u{1b}[Kx\u{1b}[m\u{1b}[K\n")
+        .stderr_is("grep: warning: GREP_COLOR='36' is deprecated; use GREP_COLORS='mt=36'\n");
+
+    // No warning when color output is disabled.
+    let (_s, mut c) = ucmd();
+    c.args(&["--color=never", "."])
+        .env("GREP_COLOR", "36")
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("x\n")
+        .no_stderr();
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();

@@ -342,6 +342,13 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         ColorMode::Never => false,
         ColorMode::Auto => std::io::stdout().is_terminal(),
     };
+    // GREP_COLOR is deprecated in favour of GREP_COLORS' `mt` capability;
+    // GNU warns about it, but only when color output is actually produced.
+    if use_color && !grep_color.is_empty() {
+        eprintln!(
+            "grep: warning: GREP_COLOR='{grep_color}' is deprecated; use GREP_COLORS='mt={grep_color}'"
+        );
+    }
     let color_config = ColorConfig::from_env(&grep_color, &grep_colors);
 
     let config = Config {
@@ -903,6 +910,11 @@ impl<'a> ColorConfig<'a> {
         for item in grep_colors.split(':') {
             if let Some((key, value)) = item.split_once('=') {
                 match key {
+                    // `mt` sets both the selected- and context-match colors.
+                    "mt" => {
+                        config.matched_selected = value;
+                        config.matched_context = value;
+                    }
                     "ms" => config.matched_selected = value,
                     "mc" => config.matched_context = value,
                     "fn" => config.filename = value,
