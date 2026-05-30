@@ -127,6 +127,60 @@ fn ere_invalid_pattern_is_error() {
 }
 
 #[test]
+fn confusing_bracket_class_is_error() {
+    // GNU grep rejects the misspelled `[:name:]` form (meant to be
+    // `[[:name:]]`) with a dedicated diagnostic and exit code 2.
+    for pattern in ["[:space:]", "[:digit:]", "[^:space:]", "x[:space:]y"] {
+        let (_s, mut c) = ucmd();
+        c.args(&[pattern])
+            .pipe_in("x\n")
+            .fails_with_code(2)
+            .stderr_is("grep: character class syntax is [[:space:]], not [:space:]\n");
+    }
+
+    // The same diagnostic applies in extended mode.
+    let (_s, mut c) = ucmd();
+    c.args(&["-E", "[:space:]"])
+        .pipe_in("x\n")
+        .fails_with_code(2)
+        .stderr_is("grep: character class syntax is [[:space:]], not [:space:]\n");
+}
+
+#[test]
+fn lookalike_brackets_are_not_confusing() {
+    // Patterns that are NOT the confusing `[:name:]` form must compile
+    // normally (no diagnostic). A proper class, a colon set, a range, a
+    // trailing colon set, and `-F` literal text all stay valid.
+    for pattern in [
+        "[[:space:]]",
+        "[::]",
+        "[:space]",
+        "[:spac-e:]",
+        "[a:space:]",
+    ] {
+        let (_s, mut c) = ucmd();
+        c.args(&[pattern])
+            .pipe_in("z\n")
+            .fails_with_code(1)
+            .no_output();
+    }
+
+    // `\[` does not open a bracket expression.
+    let (_s, mut c) = ucmd();
+    c.args(&["\\[:space:]"])
+        .pipe_in("z\n")
+        .fails_with_code(1)
+        .no_output();
+
+    // `-F` treats the text literally, so no diagnostic.
+    let (_s, mut c) = ucmd();
+    c.args(&["-F", "[:space:]"])
+        .pipe_in("x\n")
+        .fails_with_code(1)
+        .no_output();
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();

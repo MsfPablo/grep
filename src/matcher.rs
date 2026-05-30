@@ -205,6 +205,12 @@ struct CompiledPattern {
 
 impl CompiledPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
+        // GNU grep rejects the confusing `[:name:]` bracket form (a misspelled
+        // `[[:name:]]`) in basic/extended modes; oniguruma accepts it silently.
+        if matches!(config.regex_mode, RegexMode::Basic | RegexMode::Extended) {
+            check_confusing_bracket(pattern)?;
+        }
+
         let mut syntax = *match config.regex_mode {
             RegexMode::Fixed => Syntax::asis(),
             RegexMode::Basic => Syntax::grep(),
@@ -288,4 +294,140 @@ impl CompiledPattern {
             )
             .is_some()
     }
+}
+
+/// Reject the confusing `[:name:]` bracket form the way GNU grep does.
+///
+/// A bracket expression like `[:space:]` is almost always a misspelled
+/// `[[:space:]]`; GNU grep flags it with a dedicated diagnostic and exits 2,
+/// whereas oniguruma silently treats it as the set `{':','s','p',…}`. This
+/// scans the pattern for that form and returns the same error.
+fn check_confusing_bracket(pattern: &str) -> UResult<()> {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Outside a bracket a backslash escapes the next character, so
+            // `\[` does not open a bracket expression.
+            b'\\' => i += 2,
+            b'[' => {
+                i += 1;
+                if bracket_warns(bytes, &mut i) {
+                    return Err(USimpleError::new(
+                        2,
+                        "character class syntax is [[:space:]], not [:space:]".to_string(),
+                    ));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Consume a single bracket expression starting just past its opening `[` and
+/// report whether GNU grep's colon warning fires for it.
+///
+/// This is a faithful port of the `colon_warning_state` logic in GNU grep's
+/// `parse_bracket_exp` (gnulib `dfa.c`). The state is a bitmask:
+///   bit 0 — first character is a colon
+///   bit 1 — last character is a colon
+///   bit 2 — includes some other (non-colon) character
+///   bit 3 — includes a range, char/equivalence class, or collating element
+/// The warning fires exactly when the state ends equal to `7` (bits 0–2 set,
+/// bit 3 clear). On the way it advances `i` past the closing `]`.
+fn bracket_warns(bytes: &[u8], i: &mut usize) -> bool {
+    fn fetch(bytes: &[u8], i: &mut usize) -> Option<u8> {
+        let b = bytes.get(*i).copied();
+        if b.is_some() {
+            *i += 1;
+        }
+        b
+    }
+
+    let Some(first) = fetch(bytes, i) else {
+        return false;
+    };
+    let mut c = first;
+    if c == b'^' {
+        match fetch(bytes, i) {
+            Some(x) => c = x,
+            None => return false,
+        }
+    }
+    let mut state: u8 = u8::from(c == b':');
+
+    'scan: loop {
+        state &= !2;
+        let mut c1: Option<u8> = None;
+
+        if c == b'[' {
+            let Some(nc1) = fetch(bytes, i) else {
+                return false;
+            };
+            // `[:`, `[.` and `[=` introduce a class / collating / equivalence
+            // element; consume it whole and mark bit 3.
+            if nc1 == b':' || nc1 == b'.' || nc1 == b'=' {
+                loop {
+                    match fetch(bytes, i) {
+                        None => break,
+                        Some(cc) if cc == nc1 && bytes.get(*i).copied() == Some(b']') => break,
+                        Some(_) => {}
+                    }
+                }
+                if fetch(bytes, i).is_none() {
+                    return false; // consumes the `]`
+                }
+                state |= 8;
+                match fetch(bytes, i) {
+                    Some(b']') => break 'scan,
+                    Some(x) => {
+                        c = x;
+                        continue 'scan;
+                    }
+                    None => return false,
+                }
+            }
+            // Otherwise `[` is an ordinary character; `nc1` is the lookahead.
+            c1 = Some(nc1);
+        }
+
+        if c1.is_none() {
+            c1 = fetch(bytes, i);
+        }
+
+        if c1 == Some(b'-') {
+            let Some(mut c2) = fetch(bytes, i) else {
+                return false;
+            };
+            if c2 == b'[' && bytes.get(*i).copied() == Some(b'.') {
+                c2 = b']';
+            }
+            if c2 == b']' {
+                // `[x-]`: the hyphen is a literal; put the `]` back so the
+                // loop terminator sees it next.
+                *i -= 1;
+            } else {
+                state |= 8;
+                match fetch(bytes, i) {
+                    Some(b']') => break 'scan,
+                    Some(x) => {
+                        c = x;
+                        continue 'scan;
+                    }
+                    None => return false,
+                }
+            }
+        }
+
+        state |= if c == b':' { 2 } else { 4 };
+
+        match c1 {
+            Some(b']') => break 'scan,
+            Some(x) => c = x,
+            None => return false,
+        }
+    }
+
+    state == 7
 }
