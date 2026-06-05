@@ -27,5 +27,10 @@ onig_sys = { version = "*", default-features = false }
 uucore = "0.8.0"
 walkdir = "2.5"
 
+[[bench]]
+name = "grep_bench"
+harness = false
+
 [dev-dependencies]
+criterion = { version = "4.7.0", package = "codspeed-criterion-compat" }
 uutests = "0.8.0"

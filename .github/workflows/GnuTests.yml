@@ -9,6 +9,9 @@ on:
     branches:
       - '*'
 
+permissions:
+  contents: write # Publish grep instead of discarding
+
 # End the current execution if there is a new changeset in the PR.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,7 +50,21 @@ jobs:
       shell: bash
       run: |
         cd 'grep'
-        cargo build --release
+        cargo build --release --config=profile.release.strip=true
+        tar -C target/release -cf - grep | zstd -19 -o ../grep-x86_64-unknown-linux-gnu.tar.zst
+    - name: Publish latest commit
+      uses: softprops/action-gh-release@v3
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      with:
+        tag_name: latest-commit
+        body: |
+          commit: ${{ github.sha }}
+        draft: false
+        prerelease: true
+        files: |
+          grep-x86_64-unknown-linux-gnu.tar.zst
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run GNU grep testsuite
       shell: bash

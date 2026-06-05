@@ -149,6 +149,24 @@ fn quiet_match_overrides_file_error() {
 }
 
 #[test]
+fn initial_tab_skips_empty_lines() {
+    // -T aligns content with a tab, but GNU omits the tab for an empty line
+    // (a whitespace-only line still gets one). -H forces the filename prefix
+    // on, so the tab is exercised.
+    let (s, mut c) = ucmd();
+    s.fixtures.write("in", "x\n\n");
+    c.args(&["-T", "-H", "^", "in"])
+        .succeeds()
+        .stdout_is("in:\tx\nin:\n");
+
+    let (s, mut c) = ucmd();
+    s.fixtures.write("in", "x\n \n");
+    c.args(&["-T", "-H", "^", "in"])
+        .succeeds()
+        .stdout_is("in:\tx\nin:\t \n");
+}
+
+#[test]
 fn fixed_string_is_literal() {
     // Metacharacters are not interpreted.
     let (_s, mut c) = ucmd();
@@ -190,6 +208,34 @@ fn pcre_features() {
         .pipe_in("v=42\nv=7x\n")
         .succeeds()
         .stdout_only("42\n7\n");
+}
+
+#[test]
+fn perl_regexp_rejects_multiple_patterns() {
+    // GNU grep's PCRE backend (-P) only supports a single pattern.
+    // Multiple -e patterns must produce exit 2 and the canonical error message.
+    // See: https://github.com/uutils/grep/issues/34
+
+    // Two separate -e flags.
+    let (_s, mut c) = ucmd();
+    c.args(&["-P", "-e", "foo", "-e", "bar"])
+        .pipe_in("foo\nbar\n")
+        .fails_with_code(2)
+        .stderr_contains("the -P option only supports a single pattern");
+
+    // A newline inside the pattern string is split into multiple patterns.
+    let (_s, mut c) = ucmd();
+    c.args(&["-P", "-e", "foo\nbar"])
+        .pipe_in("foo\nbar\n")
+        .fails_with_code(2)
+        .stderr_contains("the -P option only supports a single pattern");
+
+    // A single pattern with -P must still work normally.
+    let (_s, mut c) = ucmd();
+    c.args(&["-P", "-e", r"\d+"])
+        .pipe_in("abc\n42\n")
+        .succeeds()
+        .stdout_only("42\n");
 }
 
 #[test]
@@ -273,6 +319,12 @@ fn word_regexp() {
         .pipe_in("foo bar\nfoobar\n")
         .succeeds()
         .stdout_only("foo bar\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-w", "$"])
+        .pipe_in("abc\n\nx\n")
+        .succeeds()
+        .stdout_only("\n");
 }
 
 #[test]
@@ -282,6 +334,12 @@ fn line_regexp() {
         .pipe_in("foo bar\nfoo bar!\nx foo bar\n")
         .succeeds()
         .stdout_only("foo bar\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-x", "$"])
+        .pipe_in("abc\n\nx\n")
+        .succeeds()
+        .stdout_only("\n");
 }
 
 #[test]
@@ -480,6 +538,25 @@ fn files_with_and_without_matches() {
     c.args(&["-l", "x", "many"])
         .succeeds()
         .stdout_only("many\n");
+}
+
+#[test]
+fn files_with_and_without_matches_mutually_exclusive() {
+    // Test that -l and -L are mutually exclusive with last-one-wins semantics
+    let (scene, mut c) = ucmd();
+    scene.fixtures.write("file", "match\n");
+
+    // -l -L: last flag (-L) wins, so no output (file has match, -L excludes it)
+    c.args(&["-l", "-L", "match", "file"])
+        .succeeds()
+        .stdout_only("");
+
+    // -L -l: last flag (-l) wins, so filename is printed
+    let (scene, mut c) = ucmd();
+    scene.fixtures.write("file", "match\n");
+    c.args(&["-L", "-l", "match", "file"])
+        .succeeds()
+        .stdout_only("file\n");
 }
 
 #[test]
@@ -1274,4 +1351,171 @@ fn repeated_options_are_accepted() {
         .pipe_in("a\nb\nc\n")
         .succeeds()
         .stdout_only("a\nb\n");
+}
+
+#[test]
+fn literal_buffer_path_prefixes_and_max() {
+    // Plain literals are served by the buffer-at-a-time engine; the line/byte
+    // prefixes and -m must still be byte-identical to the line-at-a-time path.
+
+    // -n and -b together: "lineno:byteoffset:line".
+    let (_s, mut c) = ucmd();
+    c.args(&["-nb", "foo"])
+        .pipe_in("foo\nbar\nfoobar\n")
+        .succeeds()
+        .stdout_only("1:0:foo\n3:8:foobar\n");
+
+    // A line matched more than once is still emitted once.
+    let (_s, mut c) = ucmd();
+    c.args(&["-c", "oo"])
+        .pipe_in("oooo\nbar\noo\n")
+        .succeeds()
+        .stdout_only("2\n");
+
+    // -m caps printed matches.
+    let (_s, mut c) = ucmd();
+    c.args(&["-m", "2", "x"])
+        .pipe_in("x\ny\nx\nz\nx\n")
+        .succeeds()
+        .stdout_only("x\nx\n");
+
+    // Final line without a trailing terminator still matches and is printed
+    // with an added newline.
+    let (_s, mut c) = ucmd();
+    c.args(&["foo"])
+        .pipe_in("bar\nfoo")
+        .succeeds()
+        .stdout_only("foo\n");
+}
+
+#[test]
+fn literal_buffer_path_spans_many_chunks() {
+    // Build an input far larger than the read buffer so the buffer-at-a-time
+    // engine crosses several chunk boundaries, and check that line numbers and
+    // counts stay correct across them.
+    let mut input = String::new();
+    let mut expected_n = String::new();
+    let mut count = 0u32;
+    for i in 1..=100_000u32 {
+        if i % 7 == 0 {
+            input.push_str("needle\n");
+            expected_n.push_str(&format!("{i}:needle\n"));
+            count += 1;
+        } else {
+            input.push_str("some filler text\n");
+        }
+    }
+    assert!(input.len() > 512 * 1024, "input must exceed several chunks");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-c", "needle"])
+        .pipe_in(input.clone())
+        .succeeds()
+        .stdout_only(format!("{count}\n"));
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-n", "needle"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_only(expected_n);
+}
+
+// Plain literals run on the buffer-at-a-time fast path, so the following tests
+// use bracket-class patterns (non-literal) to keep the line-at-a-time engine's
+// `-l` / `-L` / `-q` and binary-handling paths exercised too.
+
+#[test]
+fn slow_path_list_and_quiet_modes() {
+    let (scene, _) = ucmd();
+    scene.fixtures.write("hit", "yes\n");
+    scene.fixtures.write("miss", "no\n");
+
+    // -l: list matching files.
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-l", "[y]es", "hit", "miss"])
+        .succeeds()
+        .stdout_is("hit\n");
+
+    // -L with a match in one file: only the non-matching file is listed.
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-L", "[y]es", "hit", "miss"])
+        .succeeds()
+        .stdout_is("miss\n");
+
+    // -L with no match anywhere: both files listed, exit 1.
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-L", "[z]z", "hit", "miss"])
+        .fails_with_code(1)
+        .stdout_is("hit\nmiss\n");
+
+    // -q stops at the first match (exit 0) or reports no match (exit 1).
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-q", "[y]es", "hit"])
+        .succeeds()
+        .no_output();
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-q", "[z]z", "hit"])
+        .fails_with_code(1)
+        .no_output();
+}
+
+#[test]
+fn slow_path_binary_handling() {
+    let (scene, _) = ucmd();
+    // NOTE: avoid the name "nul" here — it's a reserved device name on Windows,
+    // so writing/reading it hits the null device instead of a real file.
+    scene.fixtures.write_bytes("nulbin", b"hit\0\n");
+    scene.fixtures.write_bytes("bad", b"a\x9d\n");
+
+    // Binary notice on the line-at-a-time engine (regex pattern).
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["[h]it", "nulbin"])
+        .succeeds()
+        .no_stdout()
+        .stderr_contains("binary file matches");
+
+    // -a forces text mode: the NUL line is printed verbatim.
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["-a", "[h]it", "nulbin"])
+        .succeeds()
+        .stdout_is_bytes(b"hit\0\n");
+
+    // --binary-files=without-match bails out on an invalid-UTF-8 match.
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["--binary-files=without-match", "[a]", "bad"])
+        .fails_with_code(1)
+        .no_output();
+
+    // A NUL after the matched line means binariness is discovered at EOF, so
+    // the line is printed first and the notice is emitted during finalization.
+    scene.fixtures.write_bytes("late", b"hit\nno\0\n");
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["[h]it", "late"])
+        .succeeds()
+        .stdout_is("hit\n")
+        .stderr_contains("binary file matches");
+}
+
+#[test]
+fn fast_path_binary_detected_after_a_printed_line() {
+    // A NUL that appears only after the last match in the buffer marks the file
+    // binary on the fast path *after* an earlier match was already printed: the
+    // printed line stays and the trailing notice is still emitted.
+    let (scene, _) = ucmd();
+    scene.fixtures.write_bytes("b", b"hit\nno\0\n");
+    scene
+        .cmd(env!("CARGO_BIN_EXE_grep"))
+        .args(&["hit", "b"])
+        .succeeds()
+        .stdout_is("hit\n")
+        .stderr_contains("binary file matches");
 }
