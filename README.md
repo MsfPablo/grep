@@ -47,6 +47,29 @@ cargo build --release
 cargo test
 ```
 
+### The `oniguruma` feature
+
+Regex matching is backed by [oniguruma](https://github.com/kkos/oniguruma), a C
+library built from source by `onig_sys`, so a build needs a C toolchain for the
+target. That feature is on by default and is what provides BRE, ERE and `-P`.
+
+Targets without a C toolchain can build with `--no-default-features`, which
+drops the C dependency and leaves a matcher handling literal patterns only;
+anything requiring a regex engine then exits with status 2 and an explicit
+error. This is what makes `cargo check --target wasm32-wasip1
+--no-default-features` work out of the box.
+
+It is a feature rather than a target check on purpose: a WASI build that *does*
+have a C sysroot keeps the real engine. With a
+[wasi-sdk](https://github.com/WebAssembly/wasi-sdk) installed, point the C
+toolchain at it and build with default features:
+
+```shell
+export CC_wasm32_wasip2=/opt/wasi-sdk/bin/clang
+export CFLAGS_wasm32_wasip2="--sysroot=/opt/wasi-sdk/share/wasi-sysroot"
+cargo build --target wasm32-wasip2
+```
+
 ## Pre-commit hooks
 
 This project uses [pre-commit](https://pre-commit.com); run `pre-commit install` to enable the git hooks.

@@ -1812,3 +1812,55 @@ fn only_matching_with_context() {
         .succeeds()
         .stdout_only("4:xx\n");
 }
+
+/// The crate can be built without the `oniguruma` feature (no C toolchain, e.g.
+/// a wasm32-wasi* target with no wasi-sdk sysroot). Such a build keeps literal
+/// searching and reports a clear error for anything needing a regex engine.
+#[cfg(not(feature = "oniguruma"))]
+#[test]
+fn literal_only_build_handles_plain_patterns() {
+    // Plain literals still match, including under -F, -w and -x. Case-insensitive
+    // search is not part of the fallback: folding needs the regex engine.
+    let (_s, mut c) = ucmd();
+    c.args(&["quartz"])
+        .pipe_in("granite\nquartz vein\nbasalt\n")
+        .succeeds()
+        .stdout_only("quartz vein\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-F", "3+4"])
+        .pipe_in("3+4\n34\n")
+        .succeeds()
+        .stdout_only("3+4\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-w", "kiwi"])
+        .pipe_in("kiwifruit\na kiwi here\n")
+        .succeeds()
+        .stdout_only("a kiwi here\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["-x", "solo"])
+        .pipe_in("solo\nsolo act\n")
+        .succeeds()
+        .stdout_only("solo\n");
+
+    // No match keeps the usual exit code 1.
+    let (_s, mut c) = ucmd();
+    c.args(&["obsidian"])
+        .pipe_in("granite\n")
+        .fails_with_code(1)
+        .no_output();
+}
+
+#[cfg(not(feature = "oniguruma"))]
+#[test]
+fn literal_only_build_rejects_regex_patterns() {
+    for pattern in ["gr[ae]y", "we*b", "^anchored"] {
+        let (_s, mut c) = ucmd();
+        c.args(&[pattern])
+            .pipe_in("grey\n")
+            .fails_with_code(2)
+            .stderr_contains("ASCII literal patterns only");
+    }
+}

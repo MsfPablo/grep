@@ -26,6 +26,40 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  wasm:
+    name: Check wasm32-wasip1 (no oniguruma)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      # Without a C sysroot, oniguruma cannot be built for this target, so the
+      # crate is checked with the literal-only matcher. A WASI build that does
+      # have a wasi-sdk sysroot can keep the default features instead.
+      - name: Check
+        run: cargo check --target wasm32-wasip1 --no-default-features
+
+  no-oniguruma:
+    name: Build & test without oniguruma
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --no-default-features --verbose
+
+      # Most of the suite exercises real regexes, which this configuration
+      # cannot serve; only the tests covering the fallback itself are run.
+      - name: Run fallback tests
+        run: cargo test --no-default-features --verbose literal_only_build
+
   coverage:
     name: Code coverage (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

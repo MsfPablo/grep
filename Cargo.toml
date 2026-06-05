@@ -18,12 +18,20 @@ path = "src/main.rs"
 name = "uu_grep"
 path = "src/lib.rs"
 
+[features]
+default = ["oniguruma"]
+# Full regex support, backed by the oniguruma C library. Turning it off drops
+# the C dependency and leaves a matcher that handles literal patterns only,
+# which is what lets targets without a C toolchain build the crate (e.g.
+# wasm32-wasi* with no wasi-sdk sysroot available).
+oniguruma = ["dep:onig", "dep:onig_sys"]
+
 [dependencies]
 clap = { version = "4.5", features = ["wrap_help", "cargo", "color"] }
 glob = "0.3.1"
 memchr = "2.7.2"
-onig = { version = "~6.5.1", default-features = false }
-onig_sys = { version = "*", default-features = false }
+onig = { version = "~6.5.1", default-features = false, optional = true }
+onig_sys = { version = "*", default-features = false, optional = true }
 uucore = "0.10.0"
 walkdir = "2.5"
 

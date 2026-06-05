@@ -5,15 +5,21 @@
 
 use crate::{Config, RegexMode};
 use memchr::memmem;
+#[cfg(feature = "oniguruma")]
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
+#[cfg(feature = "oniguruma")]
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
+#[cfg(feature = "oniguruma")]
 use std::ptr::{null, null_mut};
+#[cfg(feature = "oniguruma")]
 use std::sync::Mutex;
 use uucore::error::{UResult, USimpleError};
+#[cfg(feature = "oniguruma")]
 use uucore::show_warning;
 
+#[cfg(feature = "oniguruma")]
 static ONIG_NEW_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct Matcher<'a> {
@@ -115,6 +121,7 @@ impl<'a> Matcher<'a> {
     /// Word-boundary check `-w`.
     /// NOTE that `-w` does not check both sides, unlike `\b` in a regex.
     /// Start/End-of-line count as non-words.
+    #[cfg(feature = "oniguruma")]
     fn is_word_match(line: &[u8], start: usize, end: usize) -> bool {
         // SAFETY: This code uses OnigEncodingType such that it can support other types of encodings in the future.
         unsafe {
@@ -140,6 +147,24 @@ impl<'a> Matcher<'a> {
 
             true
         }
+    }
+
+    /// Without oniguruma there is no encoding table to consult, so this is a
+    /// conservative ASCII-only boundary check for the literal patterns that the
+    /// fallback matcher accepts.
+    #[cfg(not(feature = "oniguruma"))]
+    fn is_word_match(line: &[u8], start: usize, end: usize) -> bool {
+        fn is_ascii_word(byte: u8) -> bool {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        }
+
+        if end < line.len() && is_ascii_word(line[end]) {
+            return false;
+        }
+        if start > 0 && is_ascii_word(line[start - 1]) {
+            return false;
+        }
+        true
     }
 }
 
@@ -252,6 +277,7 @@ fn plain_literal(pattern: &str, ignore_case: bool, mode: RegexMode) -> Option<Ve
     plain.then(|| pattern.as_bytes().to_vec())
 }
 
+#[cfg(feature = "oniguruma")]
 struct CompiledPattern {
     /// Default semantics. It's decently fast and used for searching.
     leftmost: OnigRegex,
@@ -261,6 +287,7 @@ struct CompiledPattern {
     longest_anchored: OnigRegex,
 }
 
+#[cfg(feature = "oniguruma")]
 impl CompiledPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
         let mut syntax = *match config.regex_mode {
@@ -363,17 +390,21 @@ impl CompiledPattern {
     }
 }
 
+#[cfg(feature = "oniguruma")]
 struct OnigRegex {
     raw: onig_sys::OnigRegex,
 }
 
 // SAFETY: Oniguruma compiled regexes are immutable after construction, and this
 // wrapper owns and frees the raw pointer exactly once. This mirrors `onig::Regex`.
+#[cfg(feature = "oniguruma")]
 unsafe impl Send for OnigRegex {}
 // SAFETY: Searches only read the compiled regex. Capture storage is caller-owned
 // through `Region`, so sharing the compiled regex across threads is safe.
+#[cfg(feature = "oniguruma")]
 unsafe impl Sync for OnigRegex {}
 
+#[cfg(feature = "oniguruma")]
 impl OnigRegex {
     fn compile(pattern: &str, syntax: &Syntax, options: RegexOptions) -> Result<Self, OnigError> {
         let pattern = pattern.as_bytes();
@@ -459,6 +490,7 @@ impl OnigRegex {
     }
 }
 
+#[cfg(feature = "oniguruma")]
 impl Drop for OnigRegex {
     fn drop(&mut self) {
         // SAFETY: `raw` was returned by a successful `onig_new_deluxe` call and
@@ -467,11 +499,13 @@ impl Drop for OnigRegex {
     }
 }
 
+#[cfg(feature = "oniguruma")]
 struct OnigError {
     code: i32,
     message: String,
 }
 
+#[cfg(feature = "oniguruma")]
 impl OnigError {
     fn new(code: i32, info: *const onig_sys::OnigErrorInfo) -> Self {
         Self {
@@ -481,12 +515,14 @@ impl OnigError {
     }
 }
 
+#[cfg(feature = "oniguruma")]
 fn region_ptr(region: Option<&mut Region>) -> *mut onig_sys::OnigRegion {
     region.map_or(null_mut(), |r| {
         r as *mut Region as *mut onig_sys::OnigRegion
     })
 }
 
+#[cfg(feature = "oniguruma")]
 fn onig_match_result(result: i32) -> Option<usize> {
     if result >= 0 {
         Some(result as usize)
@@ -500,12 +536,14 @@ fn onig_match_result(result: i32) -> Option<usize> {
     }
 }
 
+#[cfg(feature = "oniguruma")]
 fn onig_error_message(code: i32, info: *const onig_sys::OnigErrorInfo) -> String {
     let mut buff = [0; onig_sys::ONIG_MAX_ERROR_MESSAGE_LEN as usize];
     let len = unsafe { onig_sys::onig_error_code_to_str(buff.as_mut_ptr(), code, info) };
     String::from_utf8_lossy(&buff[..len as usize]).into_owned()
 }
 
+#[cfg(feature = "oniguruma")]
 fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> {
     match pattern.as_bytes().first()? {
         b'?' => Some(("?", &pattern[1..])),
@@ -516,6 +554,7 @@ fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> 
     }
 }
 
+#[cfg(feature = "oniguruma")]
 fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
     let close = pattern.as_bytes().iter().position(|&b| b == b'}')?;
     let body = &pattern[1..close];
@@ -523,6 +562,49 @@ fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
         && body.bytes().all(|b| b.is_ascii_digit() || b == b',')
         && body.bytes().any(|b| b.is_ascii_digit());
     is_interval.then_some(&pattern[close + 1..])
+}
+
+/// Literal-only stand-in used when the crate is built without the `oniguruma`
+/// feature, i.e. without a regex engine to compile patterns with.
+#[cfg(not(feature = "oniguruma"))]
+struct CompiledPattern {
+    needle: Vec<u8>,
+    finder: memmem::Finder<'static>,
+}
+
+#[cfg(not(feature = "oniguruma"))]
+impl CompiledPattern {
+    fn compile(pattern: &str, config: &Config) -> UResult<Self> {
+        let Some(needle) = plain_literal(pattern, config.ignore_case, config.regex_mode) else {
+            return Err(USimpleError::new(
+                2,
+                "this build supports ASCII literal patterns only; rebuild with the `oniguruma` feature for full regex support".to_string(),
+            ));
+        };
+        let finder = memmem::Finder::new(&needle).into_owned();
+        Ok(Self { needle, finder })
+    }
+
+    /// Find the leftmost match starting at or after `offset`.
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> Option<(usize, usize)> {
+        self.finder.find(&line[offset..]).map(|relative| {
+            let start = offset + relative;
+            (start, start + self.needle.len())
+        })
+    }
+
+    /// Given a known leftmost start `start`, return the longest extent
+    /// of a match anchored exactly there.
+    fn longest_end_at(&self, line: &[u8], start: usize) -> Option<usize> {
+        line.get(start..start + self.needle.len())
+            .is_some_and(|bytes| bytes == self.needle.as_slice())
+            .then_some(start + self.needle.len())
+    }
+
+    /// True if any match exists in `line`.
+    fn is_match(&self, line: &[u8]) -> bool {
+        self.finder.find(line).is_some()
+    }
 }
 
 #[cfg(test)]
