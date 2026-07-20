@@ -1731,3 +1731,34 @@ fn fast_path_binary_detected_after_a_printed_line() {
         .stdout_is("hit\n")
         .stderr_contains("binary file matches");
 }
+
+#[test]
+fn only_matching_with_context() {
+    // `only_matching` should override any context arguments.
+    let input = "aa\nbb\ncc\nxx\n";
+
+    let (_s, mut c) = ucmd();
+    c.args(&["aa", "-o", "-A", "2"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_only("aa\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["xx", "-o", "-B", "2"])
+        .pipe_in("aa\nbb\ncc\nxx\n")
+        .succeeds()
+        .stdout_only("xx\n");
+
+    let (_s, mut c) = ucmd();
+    c.args(&["cc", "-o", "-C", "2"])
+        .pipe_in("aa\nbb\ncc\nxx\n")
+        .succeeds()
+        .stdout_only("cc\n");
+
+    // With line numbers.
+    let (_s, mut c) = ucmd();
+    c.args(&["xx", "-o", "-C", "2", "-n"])
+        .pipe_in("aa\nbb\ncc\nxx\n")
+        .succeeds()
+        .stdout_only("4:xx\n");
+}
