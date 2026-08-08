@@ -154,6 +154,34 @@ fn reversed_range_endpoints_match_gnu_message() {
 }
 
 #[test]
+fn misspelled_character_class_is_error() {
+    // `[:digit:]` is almost certainly a typo for `[[:digit:]]`; GNU rejects it
+    // with exit 2 in the basic and extended syntaxes.
+    for args in [
+        &["[:digit:]"][..],
+        &["-E", "q[^:digit:]w"][..],
+        &["-E", "[:nosuchclass:]"][..],
+    ] {
+        let (_s, mut c) = ucmd();
+        c.args(args)
+            .fails_with_code(2)
+            .stderr_contains("character class syntax is [[:space:]], not [:space:]");
+    }
+
+    // Bracket expressions that only look similar stay valid.
+    for args in [
+        &["[[:digit:]]"][..],
+        &["[::]"][..],
+        &["-E", "[:digit]"][..],
+        &["-E", "[:dig-it:]"][..],
+        &["-F", "[:digit:]"][..],
+    ] {
+        let (_s, mut c) = ucmd();
+        c.args(args).pipe_in("w[:digit:]7d\n").succeeds();
+    }
+}
+
+#[test]
 fn max_count_rewinds_seekable_stdin() {
     // -m stops mid-input after reading ahead. When standard input can seek,
     // the unread remainder must be left in place for the next reader.
