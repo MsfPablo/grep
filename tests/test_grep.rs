@@ -1051,6 +1051,26 @@ fn after_before_combined_context() {
 }
 
 #[test]
+fn before_context_is_not_rounded_to_power_of_two() {
+    // The context ring buffer rounds its slot count up to a power of two, but
+    // must still retain only the requested number of lines.
+    let input = "01\n02\n03\n04\n05\n06\n07\n08\n09\n10\nMM\n";
+
+    for (n, expected) in [
+        ("3", "08\n09\n10\nMM\n"),
+        ("5", "06\n07\n08\n09\n10\nMM\n"),
+        ("6", "05\n06\n07\n08\n09\n10\nMM\n"),
+        ("7", "04\n05\n06\n07\n08\n09\n10\nMM\n"),
+    ] {
+        let (_s, mut c) = ucmd();
+        c.args(&["-e", "MM", "-B", n])
+            .pipe_in(input)
+            .succeeds()
+            .stdout_only(expected);
+    }
+}
+
+#[test]
 fn num_shorthand_is_context() {
     // `-2` is shorthand for `-C 2`.
     let (_s, mut c) = ucmd();
