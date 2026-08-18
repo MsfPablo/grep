@@ -5,6 +5,7 @@
 
 use crate::{Config, RegexMode};
 use memchr::memmem;
+use std::borrow::Cow;
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
@@ -286,6 +287,13 @@ impl CompiledPattern {
                 "character class syntax is [[:space:]], not [:space:]".to_string(),
             ));
         }
+
+        let pattern = if config.regex_mode == RegexMode::Fixed {
+            Cow::Borrowed(pattern)
+        } else {
+            rewrite_equivalence_classes(pattern)
+        };
+        let pattern: &str = &pattern;
 
         let mut normalized_pattern = None;
         let pattern = if config.regex_mode == RegexMode::Extended {
@@ -608,6 +616,127 @@ fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
     (false, pattern.len())
 }
 
+/// Rewrite POSIX equivalence classes (`[=c=]`) to their bare member `c`.
+///
+/// A POSIX bracket expression may contain an equivalence class `[=c=]` that
+/// matches every character collating equal to `c`. In the single-byte C locale
+/// that set is just `c` itself, and oniguruma has no syntax for equivalence
+/// classes at all, so a pattern containing one cannot be compiled as-is. This
+/// function rewrites the classes oniguruma cannot express into the nearest
+/// equivalent it can, leaving everything else in the pattern untouched:
+///
+/// * `[[=a=]]` becomes `[a]`        — the class collapses to its sole member.
+/// * `[[=a=]b]` becomes `[ab]`      — members compose with other entries.
+/// * `[[=a=][=b=]]` becomes `[ab]`  — several classes in one bracket.
+/// * `x[[=a=]]y` becomes `x[a]y`    — text outside the bracket is preserved.
+///
+/// Returns a borrowed `Cow` when there is nothing to rewrite (the common case,
+/// so no allocation is needed) and an owned one otherwise.
+///
+/// A class whose body is not exactly one character is left in place, as is one
+/// used as a range endpoint (an error in GNU grep, so it must not be quietly
+/// turned into a range) or one holding `]`, `^`, `-` or `\`, whose meaning
+/// inside a bracket expression depends on where it sits.
+fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
+    let bytes = pattern.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'[' => {
+                let (rewritten, next) = scan_equivalence_bracket(pattern, i);
+                if let Some(body) = rewritten {
+                    let out = out.get_or_insert_with(String::new);
+                    out.push_str(&pattern[copied..=i]);
+                    out.push_str(&body);
+                    copied = next;
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+
+    match out {
+        None => Cow::Borrowed(pattern),
+        Some(mut s) => {
+            s.push_str(&pattern[copied..]);
+            Cow::Owned(s)
+        }
+    }
+}
+
+/// Scan a single bracket expression whose opening `[` is at `open` and rewrite
+/// every rewritable `[=c=]` equivalence class in its body to the bare member
+/// `c`. Returns the rewritten body (including the closing `]`) together with
+/// the index just past that `]`; the body is `None` when the bracket contains
+/// no rewritable equivalence class, so the caller can leave the span alone.
+/// Mirrors `scan_bracket`, which does the equivalent job for
+/// `has_confusing_bracket`, so the two stay structurally identical.
+fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Option<String>, usize) {
+    let bytes = pattern.as_bytes();
+    let mut j = open + 1;
+    if bytes.get(j) == Some(&b'^') {
+        j += 1;
+    }
+    let body_start = j;
+    let mut out: Option<String> = None;
+    let mut copied = open + 1;
+
+    while j < bytes.len() {
+        // A `]` at the very start of the body is an ordinary character; any
+        // other `]` closes the bracket.
+        if bytes[j] == b']' && j != body_start {
+            if let Some(out) = out.as_mut() {
+                out.push_str(&pattern[copied..=j]);
+            }
+            return (out, j + 1);
+        }
+        // `[:`, `[.` and `[=` subexpressions inside the bracket.
+        if bytes[j] == b'[' && matches!(bytes.get(j + 1), Some(b':' | b'.' | b'=')) {
+            let delimiter = bytes[j + 1];
+            if let Some(end) = find_bracket_subexpr_end(bytes, j + 2, delimiter) {
+                if delimiter == b'='
+                    && is_rewritable_equivalence(
+                        &pattern[j + 2..end - 2],
+                        bytes.get(end).copied(),
+                        if j > 0 { Some(bytes[j - 1]) } else { None },
+                    )
+                {
+                    let body = &pattern[j + 2..end - 2];
+                    let out = out.get_or_insert_with(String::new);
+                    out.push_str(&pattern[copied..j]);
+                    out.push_str(body);
+                    copied = end;
+                }
+                j = end;
+                continue;
+            }
+        }
+        j += 1;
+    }
+    // Unterminated bracket: leave it for the regex engine to report, but still
+    // flush whatever rewrite was already written into `out`.
+    if let Some(out) = out.as_mut() {
+        out.push_str(&pattern[copied..]);
+    }
+    (out, pattern.len())
+}
+
+/// True when a `[=...=]` equivalence class whose body is `body` can be replaced
+/// by that single character. GNU grep rejects equivalence classes used as range
+/// endpoints, so a class directly preceded or followed by `-` (`prev`/`next`)
+/// is left in place rather than silently producing a range.
+fn is_rewritable_equivalence(body: &str, next: Option<u8>, prev: Option<u8>) -> bool {
+    let in_range = next == Some(b'-') || prev == Some(b'-');
+    body.chars().count() == 1
+        && !body.starts_with([']', '^', '-', '\\'])
+        && !in_range
+}
+
 /// Index just past the `:]`, `.]` or `=]` closing a `[: [. [=` subexpression
 /// whose body starts at `start`.
 fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Option<usize> {
@@ -618,8 +747,48 @@ fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{has_confusing_bracket, plain_literal};
+    use super::{has_confusing_bracket, plain_literal, rewrite_equivalence_classes};
     use crate::RegexMode;
+    use std::borrow::Cow;
+
+    fn r(p: &str) -> Cow<'_, str> {
+        rewrite_equivalence_classes(p)
+    }
+
+    #[test]
+    fn equivalence_classes_reduce_to_their_member() {
+        // Rewrites allocate an owned string.
+        assert_eq!(&*r("[[=a=]]"), "[a]");
+        assert_eq!(&*r("[[=a=]b]"), "[ab]");
+        assert_eq!(&*r("[b[=a=]]"), "[ba]");
+        assert_eq!(&*r("[[=a=][=b=]]"), "[ab]");
+        assert_eq!(&*r("[^[=a=]]"), "[^a]");
+        assert_eq!(&*r("x[[=a=]]y"), "x[a]y");
+        assert_eq!(&*r("[[:alpha:][=a=]]"), "[[:alpha:]a]");
+        // The common case borrows the input unchanged: no allocation.
+        assert!(matches!(r("abc"), Cow::Borrowed("abc")));
+    }
+
+    #[test]
+    fn equivalence_class_rewrite_leaves_other_patterns_alone() {
+        // Nothing to do.
+        assert!(matches!(r("abc"), Cow::Borrowed(_)));
+        assert!(matches!(r("[abc]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[[:alpha:]]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[[.a.]]"), Cow::Borrowed(_)));
+        // Not a bracket expression: `[=a=]` outside `[...]` is literal in GNU.
+        assert!(matches!(r("\\[[=a=]"), Cow::Borrowed(_)));
+        // A range endpoint is an error in GNU; don't invent a valid range.
+        assert!(matches!(r("[[=a=]-c]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[a-[=c=]]"), Cow::Borrowed(_)));
+        // Only single-character classes have an obvious C-locale member.
+        assert!(matches!(r("[[=ab=]]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[[==]]"), Cow::Borrowed(_)));
+        // Members whose meaning depends on position inside the bracket.
+        assert!(matches!(r("[[=]=]]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[[=^=]]"), Cow::Borrowed(_)));
+        assert!(matches!(r("[[=-=]]"), Cow::Borrowed(_)));
+    }
 
     fn lit(p: &str, ic: bool, mode: RegexMode) -> Option<Vec<u8>> {
         plain_literal(p, ic, mode)
