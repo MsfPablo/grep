@@ -5,11 +5,11 @@
 
 use crate::{Config, RegexMode};
 use memchr::memmem;
-use std::borrow::Cow;
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
+use std::borrow::Cow;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use uucore::error::{UResult, USimpleError};
@@ -732,9 +732,7 @@ fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Option<String>, usiz
 /// is left in place rather than silently producing a range.
 fn is_rewritable_equivalence(body: &str, next: Option<u8>, prev: Option<u8>) -> bool {
     let in_range = next == Some(b'-') || prev == Some(b'-');
-    body.chars().count() == 1
-        && !body.starts_with([']', '^', '-', '\\'])
-        && !in_range
+    body.chars().count() == 1 && !body.starts_with([']', '^', '-', '\\']) && !in_range
 }
 
 /// Index just past the `:]`, `.]` or `=]` closing a `[: [. [=` subexpression
