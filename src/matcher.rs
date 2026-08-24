@@ -4,7 +4,7 @@
 // file that was distributed with this source code.
 
 use crate::{Config, RegexMode};
-use memchr::memmem;
+use memchr::{memchr, memmem};
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
@@ -549,20 +549,37 @@ fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
 /// class or collating element.
 fn has_confusing_bracket(pattern: &[u8]) -> bool {
     let mut i = 0;
-    while i < pattern.len() {
-        match pattern[i] {
-            b'\\' => i += 2,
-            b'[' => {
-                let (confusing, next) = scan_bracket(pattern, i + 1);
-                if confusing {
-                    return true;
-                }
-                i = next;
-            }
-            _ => i += 1,
+    while let Some(open) = next_unescaped_bracket(pattern, i) {
+        let (confusing, next) = scan_bracket(pattern, open + 1);
+        if confusing {
+            return true;
         }
+        i = next;
     }
     false
+}
+
+/// Index of the first `[` at or after `from` that is not escaped by a
+/// backslash, or `None` if the pattern holds no such bracket.
+///
+/// Only `[` is significant between bracket expressions, so jump straight to
+/// the next one instead of walking the pattern a byte at a time. A backslash
+/// run directly in front of the match decides whether it opens a bracket: an
+/// odd count escapes it, an even one leaves the `[` itself unescaped (`\\[`).
+fn next_unescaped_bracket(pattern: &[u8], from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(offset) = memchr(b'[', &pattern[search..]) {
+        let at = search + offset;
+        let mut backslashes = 0;
+        while at - backslashes > from && pattern[at - backslashes - 1] == b'\\' {
+            backslashes += 1;
+        }
+        if backslashes % 2 == 0 {
+            return Some(at);
+        }
+        search = at + 1;
+    }
+    None
 }
 
 /// Scan the body of a bracket expression starting at `start` (just past the
@@ -643,21 +660,15 @@ fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
     let mut copied = 0;
     let mut i = 0;
 
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'[' => {
-                let (rewritten, next) = scan_equivalence_bracket(pattern, i);
-                if let Some(body) = rewritten {
-                    let out = out.get_or_insert_with(String::new);
-                    out.push_str(&pattern[copied..=i]);
-                    out.push_str(&body);
-                    copied = next;
-                }
-                i = next;
-            }
-            _ => i += 1,
+    while let Some(open) = next_unescaped_bracket(bytes, i) {
+        let (rewritten, next) = scan_equivalence_bracket(pattern, open);
+        if let Some(body) = rewritten {
+            let out = out.get_or_insert_with(String::new);
+            out.push_str(&pattern[copied..=open]);
+            out.push_str(&body);
+            copied = next;
         }
+        i = next;
     }
 
     match out {
@@ -837,6 +848,7 @@ mod tests {
             "[:notaclass:]",
             "[:x:]",
             "ab[:blank:]",
+            "\\\\[:blank:]", // the backslash is escaped, so the bracket is not
         ] {
             assert!(has_confusing_bracket(p.as_bytes()), "pattern {p:?}");
         }
@@ -845,18 +857,19 @@ mod tests {
     #[test]
     fn accepts_bracket_expressions_that_are_not_confusing() {
         for p in [
-            "[[:digit:]]",    // the correct spelling
-            "[::]",           // no character besides the colons
-            "[:digit]",       // does not end with a colon
-            "[:digit:qrs]",   // ends with an ordinary character
-            "[:dig-it:]",     // holds a range
-            "[:x[:digit:]:]", // holds a character class
-            "[:x[.,.]:]",     // holds a collating element
-            "[:x[=e=]:]",     // holds an equivalence class
-            "\\[:digit:]",    // the bracket is escaped
-            "[]:digit:]",     // starts with a literal ']'
-            "[:digit:",       // unterminated
-            "[a-z]+[0-9]",    // no colons at all
+            "[[:digit:]]",     // the correct spelling
+            "[::]",            // no character besides the colons
+            "[:digit]",        // does not end with a colon
+            "[:digit:qrs]",    // ends with an ordinary character
+            "[:dig-it:]",      // holds a range
+            "[:x[:digit:]:]",  // holds a character class
+            "[:x[.,.]:]",      // holds a collating element
+            "[:x[=e=]:]",      // holds an equivalence class
+            "\\[:digit:]",     // the bracket is escaped
+            "\\\\\\[:digit:]", // and still escaped after an escaped backslash
+            "[]:digit:]",      // starts with a literal ']'
+            "[:digit:",        // unterminated
+            "[a-z]+[0-9]",     // no colons at all
         ] {
             assert!(!has_confusing_bracket(p.as_bytes()), "pattern {p:?}");
         }
