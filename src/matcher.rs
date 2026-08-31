@@ -656,14 +656,13 @@ fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
 /// inside a bracket expression depends on where it sits.
 fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
     let bytes = pattern.as_bytes();
-    let mut out: Option<String> = None;
+    let mut out = String::new();
     let mut copied = 0;
     let mut i = 0;
 
     while let Some(open) = next_unescaped_bracket(bytes, i) {
         let (rewritten, next) = scan_equivalence_bracket(pattern, open);
         if let Some(body) = rewritten {
-            let out = out.get_or_insert_with(String::new);
             out.push_str(&pattern[copied..=open]);
             out.push_str(&body);
             copied = next;
@@ -671,12 +670,11 @@ fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
         i = next;
     }
 
-    match out {
-        None => Cow::Borrowed(pattern),
-        Some(mut s) => {
-            s.push_str(&pattern[copied..]);
-            Cow::Owned(s)
-        }
+    if out.is_empty() {
+        Cow::Borrowed(pattern)
+    } else {
+        out.push_str(&pattern[copied..]);
+        Cow::Owned(out)
     }
 }
 
