@@ -733,7 +733,11 @@ fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Cow<'_, str>, usize)
             // member is left untouched. `prev` is the byte before the `[`, which
             // is what decides whether the class sits at a range endpoint.
             if bytes.get(j + 1) == Some(&b'=')
-                && is_rewritable_equivalence(&pattern[j + 2..end - 2], bytes.get(end).copied(), prev)
+                && is_rewritable_equivalence(
+                    &pattern[j + 2..end - 2],
+                    bytes.get(end).copied(),
+                    prev,
+                )
             {
                 out.push_str(&pattern[copied..j]);
                 out.push_str(&pattern[j + 2..end - 2]);
