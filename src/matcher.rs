@@ -4,7 +4,7 @@
 // file that was distributed with this source code.
 
 use crate::{Config, RegexMode};
-use memchr::{memchr, memmem};
+use memchr::memmem;
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
@@ -549,7 +549,7 @@ fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
 /// class or collating element.
 fn has_confusing_bracket(pattern: &[u8]) -> bool {
     let mut i = 0;
-    while let Some(open) = next_unescaped_bracket(pattern, i) {
+    while let Some(open) = next_unescaped(pattern, i, b'[') {
         let (confusing, next) = scan_bracket(pattern, open + 1);
         if confusing {
             return true;
@@ -559,25 +559,29 @@ fn has_confusing_bracket(pattern: &[u8]) -> bool {
     false
 }
 
-/// Index of the first `[` at or after `from` that is not escaped by a
-/// backslash, or `None` if the pattern holds no such bracket.
+/// Index of the first `needle` at or after `from` that is not escaped by a
+/// backslash, or `None` if the pattern holds no such byte.
 ///
-/// Only `[` is significant between bracket expressions, so jump straight to
-/// the next one instead of walking the pattern a byte at a time. A backslash
-/// run directly in front of the match decides whether it opens a bracket: an
-/// odd count escapes it, an even one leaves the `[` itself unescaped (`\\[`).
-fn next_unescaped_bracket(pattern: &[u8], from: usize) -> Option<usize> {
-    let mut search = from;
-    while let Some(offset) = memchr(b'[', &pattern[search..]) {
-        let at = search + offset;
-        let mut backslashes = 0;
-        while at - backslashes > from && pattern[at - backslashes - 1] == b'\\' {
-            backslashes += 1;
+/// Tracking the backslash run as we walk (rather than looking back from each
+/// hit) keeps the scan linear, and one helper serves every "next significant
+/// byte" search in a pattern: the opening `[` of a bracket expression, the
+/// closing `]`, and the `:`/`.`/`=` that ends a `[:`/`[.`/`[=` subexpression.
+/// An odd run of backslashes in front of a byte escapes it; an even one leaves
+/// it literal (so `\\[` is an unescaped `[`).
+fn next_unescaped(pattern: &[u8], mut from: usize, needle: u8) -> Option<usize> {
+    let mut escape = false;
+    while from < pattern.len() {
+        match pattern[from] {
+            b'\\' => escape = !escape,
+            c if c == needle => {
+                if !escape {
+                    return Some(from);
+                }
+                escape = false;
+            }
+            _ => escape = false,
         }
-        if backslashes % 2 == 0 {
-            return Some(at);
-        }
-        search = at + 1;
+        from += 1;
     }
     None
 }
@@ -610,13 +614,12 @@ fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
         // Only the character just before the closing `]` counts as the last one.
         state &= !LAST_IS_COLON;
         // `[:alpha:]`, `[.a.]` and `[=a=]` inside the bracket.
-        if c == b'[' && matches!(pattern.get(i + 1), Some(b':' | b'.' | b'=')) {
-            let delimiter = pattern[i + 1];
-            if let Some(end) = find_bracket_subexpr_end(pattern, i + 2, delimiter) {
-                state |= HAS_RANGE_OR_CLASS;
-                i = end;
-                continue;
-            }
+        if c == b'['
+            && let Some(end) = bracket_subexpr_end(pattern, i)
+        {
+            state |= HAS_RANGE_OR_CLASS;
+            i = end;
+            continue;
         }
         // `x-y` is a range, but the `-` of `[x-]` is an ordinary character.
         if pattern.get(i + 1) == Some(&b'-')
@@ -660,9 +663,9 @@ fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
     let mut copied = 0;
     let mut i = 0;
 
-    while let Some(open) = next_unescaped_bracket(bytes, i) {
-        let (rewritten, next) = scan_equivalence_bracket(pattern, open);
-        if let Some(body) = rewritten {
+    while let Some(open) = next_unescaped(bytes, i, b'[') {
+        let (body, next) = scan_equivalence_bracket(pattern, open);
+        if let Cow::Owned(body) = body {
             out.push_str(&pattern[copied..=open]);
             out.push_str(&body);
             copied = next;
@@ -680,59 +683,77 @@ fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
 
 /// Scan a single bracket expression whose opening `[` is at `open` and rewrite
 /// every rewritable `[=c=]` equivalence class in its body to the bare member
-/// `c`. Returns the rewritten body (including the closing `]`) together with
-/// the index just past that `]`; the body is `None` when the bracket contains
-/// no rewritable equivalence class, so the caller can leave the span alone.
+/// `c`.
+///
+/// Returns the body — from just past the `[` through the closing `]` —
+/// together with the index just past that `]`. The body is borrowed when the
+/// bracket holds no rewritable class (the caller can leave the span untouched
+/// and skip the allocation) and owned once at least one class was collapsed:
+///
+/// * `[[=a=]]`  scans to the borrowed span `=a=]`, then rewrites it to `a]`.
+/// * `[[=a=]b]` keeps the trailing `b]` and rewrites to `ab]`.
+///
 /// Mirrors `scan_bracket`, which does the equivalent job for
-/// `has_confusing_bracket`, so the two stay structurally identical.
-fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Option<String>, usize) {
+/// `has_confusing_bracket`, so the two stay structurally alike.
+fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Cow<'_, str>, usize) {
     let bytes = pattern.as_bytes();
     let mut j = open + 1;
     if bytes.get(j) == Some(&b'^') {
         j += 1;
     }
+    // A `]` at the very start of the body is an ordinary character; any later
+    // unescaped `]` closes the bracket.
     let body_start = j;
-    let mut out: Option<String> = None;
-    let mut copied = open + 1;
-
-    while j < bytes.len() {
-        // A `]` at the very start of the body is an ordinary character; any
-        // other `]` closes the bracket.
-        if bytes[j] == b']' && j != body_start {
-            if let Some(out) = out.as_mut() {
-                out.push_str(&pattern[copied..=j]);
-            }
-            return (out, j + 1);
-        }
-        // `[:`, `[.` and `[=` subexpressions inside the bracket.
-        if bytes[j] == b'[' && matches!(bytes.get(j + 1), Some(b':' | b'.' | b'=')) {
-            let delimiter = bytes[j + 1];
-            if let Some(end) = find_bracket_subexpr_end(bytes, j + 2, delimiter) {
-                if delimiter == b'='
-                    && is_rewritable_equivalence(
-                        &pattern[j + 2..end - 2],
-                        bytes.get(end).copied(),
-                        if j > 0 { Some(bytes[j - 1]) } else { None },
-                    )
-                {
-                    let body = &pattern[j + 2..end - 2];
-                    let out = out.get_or_insert_with(String::new);
-                    out.push_str(&pattern[copied..j]);
-                    out.push_str(body);
-                    copied = end;
-                }
-                j = end;
-                continue;
-            }
-        }
+    if bytes.get(j) == Some(&b']') {
         j += 1;
     }
-    // Unterminated bracket: leave it for the regex engine to report, but still
-    // flush whatever rewrite was already written into `out`.
-    if let Some(out) = out.as_mut() {
-        out.push_str(&pattern[copied..]);
+
+    let mut out = String::new();
+    let mut copied = open + 1;
+    let mut escape = false;
+
+    while j < bytes.len() {
+        let c = bytes[j];
+        if !escape && c == b']' && j != body_start {
+            if !out.is_empty() {
+                out.push_str(&pattern[copied..=j]);
+                return (Cow::Owned(out), j + 1);
+            }
+            return (Cow::Borrowed(&pattern[open + 1..=j]), j + 1);
+        }
+        // A `[:`, `[.` or `[=` subexpression inside the bracket. A preceding
+        // backslash escapes the `[`, so it is a literal, not a subexpr start.
+        if !escape
+            && c == b'['
+            && let Some(end) = bracket_subexpr_end(bytes, j)
+        {
+            if bytes[j + 1] == b'='
+                && is_rewritable_equivalence(
+                    &pattern[j + 2..end - 2],
+                    bytes.get(end).copied(),
+                    bytes.get(j.wrapping_sub(1)).copied(),
+                )
+            {
+                out.push_str(&pattern[copied..j]);
+                out.push_str(&pattern[j + 2..end - 2]);
+                copied = end;
+            }
+            j = end;
+            escape = false;
+            continue;
+        }
+        escape = c == b'\\' && !escape;
+        j += 1;
     }
-    (out, pattern.len())
+
+    // Unterminated bracket: leave it for the regex engine to report, but flush
+    // whatever rewrite was already written into `out`.
+    if out.is_empty() {
+        (Cow::Borrowed(&pattern[open + 1..]), bytes.len())
+    } else {
+        out.push_str(&pattern[copied..]);
+        (Cow::Owned(out), bytes.len())
+    }
 }
 
 /// True when a `[=...=]` equivalence class whose body is `body` can be replaced
@@ -744,12 +765,24 @@ fn is_rewritable_equivalence(body: &str, next: Option<u8>, prev: Option<u8>) -> 
     body.chars().count() == 1 && !body.starts_with([']', '^', '-', '\\']) && !in_range
 }
 
-/// Index just past the `:]`, `.]` or `=]` closing a `[: [. [=` subexpression
-/// whose body starts at `start`.
-fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Option<usize> {
-    (start..pattern.len().saturating_sub(1))
-        .find(|&i| pattern[i] == delimiter && pattern[i + 1] == b']')
-        .map(|i| i + 2)
+/// If a `[:`, `[.` or `[=` subexpression starts at `start` (the `[`), return the
+/// index just past its closing `:]`/`.]`/`=]`. The closing delimiter must not be
+/// escaped, so a `\:` (or `\.`/`\=`) in the body does not end the subexpression.
+/// Both `scan_bracket` and `scan_equivalence_bracket` share this helper so the
+/// two stay consistent.
+fn bracket_subexpr_end(pattern: &[u8], start: usize) -> Option<usize> {
+    let delimiter = *pattern.get(start + 1)?;
+    if !matches!(delimiter, b':' | b'.' | b'=') {
+        return None;
+    }
+    let mut from = start + 2;
+    loop {
+        let at = next_unescaped(pattern, from, delimiter)?;
+        if pattern.get(at + 1) == Some(&b']') {
+            return Some(at + 2);
+        }
+        from = at + 1;
+    }
 }
 
 #[cfg(test)]
