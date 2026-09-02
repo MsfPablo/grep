@@ -697,57 +697,61 @@ fn rewrite_equivalence_classes(pattern: &str) -> Cow<'_, str> {
 /// `has_confusing_bracket`, so the two stay structurally alike.
 fn scan_equivalence_bracket(pattern: &str, open: usize) -> (Cow<'_, str>, usize) {
     let bytes = pattern.as_bytes();
+    // The body starts just past `[`. A leading `^` negates the bracket and a
+    // `]` right after it (or after the `^`) is an ordinary member, so neither
+    // can close the bracket; skip both before the scan begins.
     let mut j = open + 1;
     if bytes.get(j) == Some(&b'^') {
         j += 1;
     }
-    // A `]` at the very start of the body is an ordinary character; any later
-    // unescaped `]` closes the bracket.
     let body_start = j;
     if bytes.get(j) == Some(&b']') {
         j += 1;
     }
 
     let mut out = String::new();
-    let mut copied = open + 1;
+    let mut copied = open + 1; // first body byte not yet written into `out`
+    let mut prev: Option<u8> = None; // the byte before `j`, for range-endpoint checks
     let mut escape = false;
 
-    while j < bytes.len() {
-        let c = bytes[j];
+    while let Some(&c) = bytes.get(j) {
+        // An unescaped `]` that is not the leading literal one closes the bracket.
         if !escape && c == b']' && j != body_start {
-            if !out.is_empty() {
-                out.push_str(&pattern[copied..=j]);
-                return (Cow::Owned(out), j + 1);
+            if out.is_empty() {
+                return (Cow::Borrowed(&pattern[open + 1..=j]), j + 1);
             }
-            return (Cow::Borrowed(&pattern[open + 1..=j]), j + 1);
+            out.push_str(&pattern[copied..=j]);
+            return (Cow::Owned(out), j + 1);
         }
-        // A `[:`, `[.` or `[=` subexpression inside the bracket. A preceding
-        // backslash escapes the `[`, so it is a literal, not a subexpr start.
+        // An unescaped `[` may open a `[:...]`, `[...]` or `[=...]` member. A
+        // preceding backslash escapes it, so it is a literal, not a member start.
         if !escape
             && c == b'['
             && let Some(end) = bracket_subexpr_end(bytes, j)
         {
-            if bytes[j + 1] == b'='
-                && is_rewritable_equivalence(
-                    &pattern[j + 2..end - 2],
-                    bytes.get(end).copied(),
-                    bytes.get(j.wrapping_sub(1)).copied(),
-                )
+            // A rewritable `[=c=]` collapses to its sole member `c`; any other
+            // member is left untouched. `prev` is the byte before the `[`, which
+            // is what decides whether the class sits at a range endpoint.
+            if bytes.get(j + 1) == Some(&b'=')
+                && is_rewritable_equivalence(&pattern[j + 2..end - 2], bytes.get(end).copied(), prev)
             {
                 out.push_str(&pattern[copied..j]);
                 out.push_str(&pattern[j + 2..end - 2]);
                 copied = end;
             }
+            // A member always ends in `]`, so the next byte cannot be mid-range.
+            prev = Some(b']');
             j = end;
             escape = false;
             continue;
         }
         escape = c == b'\\' && !escape;
+        prev = Some(c);
         j += 1;
     }
 
-    // Unterminated bracket: leave it for the regex engine to report, but flush
-    // whatever rewrite was already written into `out`.
+    // Unterminated bracket: let the regex engine report it. Flush any rewrite
+    // already started; otherwise lend the body back unchanged.
     if out.is_empty() {
         (Cow::Borrowed(&pattern[open + 1..]), bytes.len())
     } else {
